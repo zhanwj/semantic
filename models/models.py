@@ -11,7 +11,7 @@ class SegmentationModuleBase(nn.Module):
 
     def pixel_acc(self, pred, label):
         _, preds = torch.max(pred, dim=1)
-        valid = (label >= 0).long()
+        valid = (label != 255).long()
         acc_sum = torch.sum(valid * (preds == label).long())
         pixel_sum = torch.sum(valid)
         acc = acc_sum.float() / (pixel_sum.float() + 1e-10)
@@ -24,9 +24,22 @@ class SegmentationModule(SegmentationModuleBase):
         self.encoder = net_enc
         self.decoder = net_dec
         self.crit = crit
+        self.crit=nn.NLLLoss(ignore_index=255)
         self.deep_sup_scale = deep_sup_scale
 
     def forward(self, feed_dict, *, segSize=None):
+        if not isinstance(feed_dict,dict):
+            feed_dict=feed_dict[0]
+        #print("feed_dict:",type(feed_dict))
+        #feed_dict['img_data']=feed_dict['img_data'].cuda()
+        #feed_dict['seg_label']=feed_dict['seg_label'].cuda()
+        #img_data=feed_dict['img_data']
+        #seg_label=feed_dict['seg_label']
+        #img_data=img_data.cuda()
+        #seg_label=seg_label.cuda()
+        feed_dict['img_data']=feed_dict['img_data'].cuda()
+        feed_dict['seg_label']=feed_dict['seg_label'].cuda()
+        #print(feed_dict[0])
         # training
         if segSize is None:
             if self.deep_sup_scale is not None: # use deep supervision technique
@@ -34,12 +47,14 @@ class SegmentationModule(SegmentationModuleBase):
             else:
                 pred = self.decoder(self.encoder(feed_dict['img_data'], return_feature_maps=True))
 
+            pred=nn.functional.interpolate(pred,size=feed_dict['seg_label'].shape[-2:],mode='bilinear',align_corners=False)
             loss = self.crit(pred, feed_dict['seg_label'])
             if self.deep_sup_scale is not None:
                 loss_deepsup = self.crit(pred_deepsup, feed_dict['seg_label'])
                 loss = loss + loss_deepsup * self.deep_sup_scale
 
             acc = self.pixel_acc(pred, feed_dict['seg_label'])
+            
             return loss, acc
         # inference
         else:
@@ -102,9 +117,14 @@ class ModelBuilder():
         elif arch == 'resnet101':
             orig_resnet = resnet.__dict__['resnet101'](pretrained=pretrained)
             net_encoder = Resnet(orig_resnet)
-        elif arch == 'resnet101dilated':
+        elif arch == 'resnet101dilated8':
             orig_resnet = resnet.__dict__['resnet101'](pretrained=pretrained)
             net_encoder = ResnetDilated(orig_resnet, dilate_scale=8)
+
+        elif arch == 'resnet101dilated16':
+            orig_resnet = resnet.__dict__['resnet101'](pretrained=pretrained)
+            net_encoder = ResnetDilated(orig_resnet, dilate_scale=16)
+
         elif arch == 'resnext101':
             orig_resnext = resnext.__dict__['resnext101'](pretrained=pretrained)
             net_encoder = Resnet(orig_resnext) # we can still use class Resnet

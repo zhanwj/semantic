@@ -1,3 +1,4 @@
+from tensorboardX import SummaryWriter
 # System libs
 import os
 import time
@@ -14,8 +15,23 @@ from models import ModelBuilder, SegmentationModule
 from utils import AverageMeter
 from lib.nn import UserScatteredDataParallel, user_scattered_collate, patch_replication_callback
 import lib.utils.data as torchdata
+from datetime import datetime
+import socket
+
+def get_run_name():
+    """ A unique name for each run """
+    return datetime.now().strftime(
+        '%b%d-%H:%M:%S') 
 
 
+def tb_log_stats(logger,stats, cur_iter):
+        """Log the tracked statistics to tensorboard"""
+        for k in stats:
+            v = stats[k]
+            if isinstance(v, dict):
+                tb_log_stats(v, cur_iter)
+            else:
+                logger.add_scalar(k, v, cur_iter)
 # train one epoch
 def train(segmentation_module, iterator, optimizers, history, epoch, args):
     batch_time = AverageMeter()
@@ -34,9 +50,10 @@ def train(segmentation_module, iterator, optimizers, history, epoch, args):
         segmentation_module.zero_grad()
 
         # forward pass
+        
         loss, acc = segmentation_module(batch_data)
         loss = loss.mean()
-        acc = acc.mean()
+        #acc = acc.mean()
 
         # Backward
         loss.backward()
@@ -49,6 +66,7 @@ def train(segmentation_module, iterator, optimizers, history, epoch, args):
 
         # update average loss and acc
         ave_total_loss.update(loss.data.item())
+        acc=acc.mean()
         ave_acc.update(acc.data.item()*100)
 
         # calculate accuracy, and display
@@ -65,6 +83,11 @@ def train(segmentation_module, iterator, optimizers, history, epoch, args):
             history['train']['epoch'].append(fractional_epoch)
             history['train']['loss'].append(loss.data.item())
             history['train']['acc'].append(acc.data.item())
+            stats_to_tb={}
+            stats_to_tb['loss_semseg']=loss.data.item()
+            stats_to_tb['accuracy_pixel']=acc.data.item()
+            cur_iter = i + (epoch - 1) * args.epoch_iters
+            tb_log_stats(tblogger,stats_to_tb,cur_iter)
 
         # adjust learning rate
         cur_iter = i + (epoch - 1) * args.epoch_iters
@@ -93,6 +116,7 @@ def checkpoint(nets, history, args, epoch_num):
 def group_weight(module):
     group_decay = []
     group_no_decay = []
+    group_batch_decay=[]
     for m in module.modules():
         if isinstance(m, nn.Linear):
             group_decay.append(m.weight)
@@ -102,12 +126,19 @@ def group_weight(module):
             group_decay.append(m.weight)
             if m.bias is not None:
                 group_no_decay.append(m.bias)
+        #elif isinstance(m, nn.modules.batchnorm._BatchNorm):
+        #    if m.weight is not None:
+        #        group_batch_decay.append(m.weight)
+        #    if m.bias is not None:
+        #        group_batch_decay.append(m.bias)
         elif isinstance(m, nn.modules.batchnorm._BatchNorm):
             if m.weight is not None:
                 group_no_decay.append(m.weight)
             if m.bias is not None:
                 group_no_decay.append(m.bias)
 
+    #assert len(list(module.parameters())) == len(group_decay) + len(group_no_decay)+len(group_batch_decay)
+    #groups = [dict(params=group_decay), dict(params=group_no_decay, weight_decay=.0),dict(params=group_batch_decay,weight_decay=0.9997)]
     assert len(list(module.parameters())) == len(group_decay) + len(group_no_decay)
     groups = [dict(params=group_decay), dict(params=group_no_decay, weight_decay=.0)]
     return groups
@@ -153,7 +184,7 @@ def main(args):
         num_class=args.num_class,
         weights=args.weights_decoder)
 
-    crit = nn.NLLLoss(ignore_index=-1)
+    crit = nn.NLLLoss(ignore_index=255)
 
     if args.arch_decoder.endswith('deepsup'):
         segmentation_module = SegmentationModule(
@@ -165,7 +196,7 @@ def main(args):
     # Dataset and Loader
     dataset_train = TrainDataset(
         args.list_train, args, batch_per_gpu=args.batch_size_per_gpu)
-
+    args.epoch_iters=dataset_train.num_sample//(args.num_gpus*args.batch_size_per_gpu)
     loader_train = torchdata.DataLoader(
         dataset_train,
         batch_size=args.num_gpus,  # we have modified data_parallel
@@ -200,7 +231,8 @@ def main(args):
         train(segmentation_module, iterator_train, optimizers, history, epoch, args)
 
         # checkpointing
-        checkpoint(nets, history, args, epoch)
+        if epoch%10==0:
+            checkpoint(nets, history, args, epoch)
 
     print('Training Done!')
 
@@ -241,7 +273,7 @@ if __name__ == '__main__':
                         help='epochs to train for')
     parser.add_argument('--start_epoch', default=1, type=int,
                         help='epoch to start training. useful if continue from a checkpoint')
-    parser.add_argument('--epoch_iters', default=5000, type=int,
+    parser.add_argument('--epoch_iters', default=2975, type=int,
                         help='iterations of each epoch (irrelevant to batch size)')
     parser.add_argument('--optim', default='SGD', help='optimizer')
     parser.add_argument('--lr_encoder', default=2e-2, type=float, help='LR')
@@ -262,7 +294,7 @@ if __name__ == '__main__':
                         help='number of classes')
     parser.add_argument('--workers', default=16, type=int,
                         help='number of data loading workers')
-    parser.add_argument('--imgSize', default=[300,375,450,525,600], nargs='+', type=int,
+    parser.add_argument('--imgSize', default=[0.5,1.0,1.5], nargs='+', type=float,
                         help='input image size of short edge (int or list)')
     parser.add_argument('--imgMaxSize', default=1000, type=int,
                         help='maximum input image size of long edge')
@@ -272,6 +304,10 @@ if __name__ == '__main__':
                         help='downsampling rate of the segmentation label')
     parser.add_argument('--random_flip', default=True, type=bool,
                         help='if horizontally flip images when training')
+    parser.add_argument('--data_shape', default=[1024,2048], nargs='+', type=int,
+                        help='shape of input data')
+    parser.add_argument('--input_size', default=[768,768], nargs='+', type=int,
+                        help='shape of input data')
 
     # Misc arguments
     parser.add_argument('--seed', default=304, type=int, help='manual seed')
@@ -285,9 +321,17 @@ if __name__ == '__main__':
     for key, val in vars(args).items():
         print("{:16} {}".format(key, val))
 
+    lr_encoder=args.lr_encoder*((args.num_gpus*args.batch_size_per_gpu)/16)
+    lr_decoder=args.lr_decoder*((args.num_gpus*args.batch_size_per_gpu)/16)
+    print("encoder learning have been adjust {}-------------->{}!".format(args.lr_encoder,lr_encoder))
+    print("decoder learning have been adjust {}-------------->{}!".format(args.lr_encoder,lr_decoder))
+    args.lr_encoder=lr_encoder
+    args.lr_decoder=lr_decoder
+
     args.arch_encoder = args.arch_encoder.lower()
     args.arch_decoder = args.arch_decoder.lower()
     args.batch_size = args.num_gpus * args.batch_size_per_gpu
+    
     args.max_iters = args.epoch_iters * args.num_epoch
     args.running_lr_encoder = args.lr_encoder
     args.running_lr_decoder = args.lr_decoder
@@ -296,20 +340,17 @@ if __name__ == '__main__':
     args.id += '-' + args.arch_decoder
     args.id += '-ngpus' + str(args.num_gpus)
     args.id += '-batchSize' + str(args.batch_size)
-    args.id += '-imgMaxSize' + str(args.imgMaxSize)
-    args.id += '-paddingConst' + str(args.padding_constant)
-    args.id += '-segmDownsampleRate' + str(args.segm_downsampling_rate)
-    args.id += '-LR_encoder' + str(args.lr_encoder)
-    args.id += '-LR_decoder' + str(args.lr_decoder)
     args.id += '-epoch' + str(args.num_epoch)
     if args.fix_bn:
         args.id += '-fixBN'
     print('Model ID: {}'.format(args.id))
 
-    args.ckpt = os.path.join(args.ckpt, args.id)
+    now=get_run_name()
+    args.ckpt = os.path.join(args.ckpt,args.id,now)
+    
     if not os.path.isdir(args.ckpt):
         os.makedirs(args.ckpt)
-
+    tblogger = SummaryWriter(args.ckpt)
     random.seed(args.seed)
     torch.manual_seed(args.seed)
 
